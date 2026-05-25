@@ -895,6 +895,89 @@ Judging rules:
         }
 
     @staticmethod
+    def _target_hit_at(recalled_ids: list[str], target_ids: set[str], k: int) -> bool:
+        if not target_ids:
+            return False
+        return bool(set(recalled_ids[:k]) & target_ids)
+
+    @staticmethod
+    def _target_front_hit(recalled_ids: list[str], target_ids: set[str]) -> bool:
+        """
+        Strict R@1 for one or more target memories.
+
+        - If there is one target memory, it must be ranked first.
+        - If there are multiple target memories, all target memories must occupy
+          the first len(target_ids) positions, in any order, with no non-target
+          memory interleaved before the full target prefix is complete.
+        """
+        if not target_ids:
+            return False
+
+        n_targets = len(target_ids)
+        if len(recalled_ids) < n_targets:
+            return False
+
+        return set(recalled_ids[:n_targets]) == target_ids
+
+    @staticmethod
+    def _record_gate_aware_recall_scores(record: dict[str, Any]) -> dict[str, int]:
+        """
+        Gate-aware recall scoring.
+
+        Overall score:
+        - If the gate decision is wrong, all R@k scores are 0.
+        - If gold should_inject is false and the gate correctly rejects, all R@k
+          scores are 1 because no memory should be recalled/used.
+        - If gold should_inject is true and the gate correctly injects, R@k is
+          computed against target_memories in recalled_ids.
+
+        Positive/gate-true score:
+        - Only meaningful for gold should_inject=true records.
+        - If gate is wrong, score is 0.
+        - Otherwise R@k is computed against target_memories.
+        """
+        gold_should = bool(record["stage1"]["gold_should_inject"])
+        gate_correct = bool(record["stage1"]["correct"])
+        recalled_ids = list(record.get("recalled_ids", []))
+        target_ids = set(record.get("gold", {}).get("target_memories", []))
+
+        if not gate_correct:
+            return {
+                "overall_r10": 0,
+                "overall_r5": 0,
+                "overall_r1": 0,
+                "positive_r10": 0,
+                "positive_r5": 0,
+                "positive_r1": 0,
+                "is_positive": int(gold_should),
+            }
+
+        if not gold_should:
+            return {
+                "overall_r10": 1,
+                "overall_r5": 1,
+                "overall_r1": 1,
+                "positive_r10": 0,
+                "positive_r5": 0,
+                "positive_r1": 0,
+                "is_positive": 0,
+            }
+
+        r10 = int(MemGateEvaluator._target_hit_at(recalled_ids, target_ids, 10))
+        r5 = int(MemGateEvaluator._target_hit_at(recalled_ids, target_ids, 5))
+        r1 = int(MemGateEvaluator._target_front_hit(recalled_ids, target_ids))
+
+        return {
+            "overall_r10": r10,
+            "overall_r5": r5,
+            "overall_r1": r1,
+            "positive_r10": r10,
+            "positive_r5": r5,
+            "positive_r1": r1,
+            "is_positive": 1,
+        }
+
+    @staticmethod
     def _aggregate(
         records: list[dict[str, Any]],
         *,
@@ -1016,7 +1099,43 @@ Judging rules:
                 ),
             }
 
+        gate_aware_scores = [
+            MemGateEvaluator._record_gate_aware_recall_scores(r) for r in records
+        ]
+        positive_scores = [s for s in gate_aware_scores if s["is_positive"]]
+
+        primary_metrics = {
+            "gate_accuracy": round(_mean(stage1_correct), 4),
+            "overall_recall_at_10": round(
+                _mean([s["overall_r10"] for s in gate_aware_scores]),
+                4,
+            ),
+            "overall_recall_at_5": round(
+                _mean([s["overall_r5"] for s in gate_aware_scores]),
+                4,
+            ),
+            "overall_recall_at_1": round(
+                _mean([s["overall_r1"] for s in gate_aware_scores]),
+                4,
+            ),
+            "gate_true_recall_at_10": round(
+                _mean([s["positive_r10"] for s in positive_scores]),
+                4,
+            ),
+            "gate_true_recall_at_5": round(
+                _mean([s["positive_r5"] for s in positive_scores]),
+                4,
+            ),
+            "gate_true_recall_at_1": round(
+                _mean([s["positive_r1"] for s in positive_scores]),
+                4,
+            ),
+            "n_total": len(records),
+            "n_gate_true": len(positive_scores),
+        }
+
         result: dict[str, Any] = {
+            "primary_metrics": primary_metrics,
             "stage0_recall_diagnostic": {
                 "positive_target_recall_rate": round(
                     _mean(positive_target_recalled),
@@ -1135,75 +1254,23 @@ Judging rules:
 
     @staticmethod
     def format_report(result: dict[str, Any]) -> str:
-        stage0 = result.get("stage0_recall_diagnostic", {})
-        stage1 = result.get("stage1_injection_decision", {})
-        stage2 = result.get("stage2_selection", {})
-        diag = result.get("diagnostics", {})
-        by_probe = result.get("by_probe_type", {})
-        timing = result.get("timing", {})
+        primary = result.get("primary_metrics", {})
+        availability = result.get("availability_pairs")
 
         rows = [
-            (
-                "Required recall@k",
-                MemGateEvaluator._fmt_pct(stage0.get("positive_target_recall_rate")),
-                "Can direct user-input retrieval find target memory?",
-            ),
-            (
-                "Gate accuracy",
-                MemGateEvaluator._fmt_pct(stage1.get("accuracy")),
-                "Overall should_inject decision accuracy.",
-            ),
-            (
-                "Gate precision",
-                MemGateEvaluator._fmt_pct(stage1.get("precision")),
-                "When system injects, how often it should inject.",
-            ),
-            (
-                "Gate recall",
-                MemGateEvaluator._fmt_pct(stage1.get("recall")),
-                "When memory is required, how often system injects.",
-            ),
-            (
-                "False injection",
-                MemGateEvaluator._fmt_pct(stage1.get("false_injection_rate")),
-                "Injection rate on neutral/forbidden probes.",
-            ),
-            (
-                "Target selected",
-                MemGateEvaluator._fmt_pct(
-                    stage2.get("target_selection_rate_when_gold_and_pred_inject")
-                ),
-                "Target memory selected when injection is needed.",
-            ),
-            (
-                "Forbidden selected",
-                MemGateEvaluator._fmt_pct(
-                    stage2.get("forbidden_selection_rate_when_negative_injected")
-                ),
-                "Forbidden memory selected when system wrongly injects.",
-            ),
+            ("Gate Acc", primary.get("gate_accuracy")),
+            ("Overall R@10", primary.get("overall_recall_at_10")),
+            ("Overall R@5", primary.get("overall_recall_at_5")),
+            ("Overall R@1", primary.get("overall_recall_at_1")),
+            ("Gate=True R@10", primary.get("gate_true_recall_at_10")),
+            ("Gate=True R@5", primary.get("gate_true_recall_at_5")),
+            ("Gate=True R@1", primary.get("gate_true_recall_at_1")),
         ]
-
-        probe_rows = []
-        for probe_type in ("required", "neutral", "forbidden"):
-            item = by_probe.get(probe_type)
-            if not item:
-                continue
-            probe_rows.append(
-                (
-                    probe_type,
-                    str(item.get("n", 0)),
-                    MemGateEvaluator._fmt_pct(item.get("stage0_target_recall_rate")),
-                    MemGateEvaluator._fmt_pct(item.get("stage0_forbidden_recall_rate")),
-                    MemGateEvaluator._fmt_pct(item.get("injection_rate")),
-                    MemGateEvaluator._fmt_pct(item.get("stage1_accuracy")),
-                )
-            )
 
         lines: list[str] = []
         lines.append("")
         lines.append("MemGate Summary")
-        lines.append("=" * 78)
+        lines.append("=" * 52)
         lines.append(
             f"dataset={result.get('dataset_path')} | "
             f"samples={result.get('n_samples')} | "
@@ -1211,56 +1278,24 @@ Judging rules:
             f"stage3={'on' if result.get('stage3_enabled') else 'off'}"
         )
         lines.append("")
+        lines.append(f"{'Metric':<18} {'Value':>8}")
+        lines.append(f"{'-' * 18} {'-' * 8}")
+        for name, value in rows:
+            lines.append(f"{name:<18} {MemGateEvaluator._fmt_pct(value):>8}")
 
-        lines.append("Main metrics")
-        lines.append("-" * 78)
-        lines.append(f"{'Metric':<22} {'Value':<10} Note")
-        lines.append(f"{'-' * 22} {'-' * 10} {'-' * 40}")
-        for name, value, note in rows:
-            lines.append(f"{name:<22} {value:<10} {note}")
-
-        lines.append("")
-        lines.append("Probe breakdown")
-        lines.append("-" * 78)
-        lines.append(
-            f"{'Probe':<12} {'n':<5} {'target@k':<10} "
-            f"{'forbid@k':<10} {'inject':<10} {'acc':<10}"
-        )
-        lines.append(
-            f"{'-' * 12} {'-' * 5} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}"
-        )
-        for probe, n, target, forbidden, inject, acc in probe_rows:
+        if availability:
+            lines.append("")
+            lines.append("Availability")
+            lines.append("-" * 52)
             lines.append(
-                f"{probe:<12} {n:<5} {target:<10} "
-                f"{forbidden:<10} {inject:<10} {acc:<10}"
+                f"pairs={availability.get('n_complete_pairs', 0)}/"
+                f"{availability.get('n_pairs', 0)} | "
+                f"pair_acc={MemGateEvaluator._fmt_pct(availability.get('pair_accuracy'))} | "
+                f"no_mem_fi={MemGateEvaluator._fmt_pct(availability.get('without_memory_false_injection_rate'))}"
             )
 
-        confusion = stage1.get("confusion", {})
-        lines.append("")
-        lines.append("Confusion")
-        lines.append("-" * 78)
-        lines.append(
-            f"TP={confusion.get('tp', 0)} | "
-            f"FP={confusion.get('fp', 0)} | "
-            f"FN={confusion.get('fn', 0)} | "
-            f"TN={confusion.get('tn', 0)}"
-        )
-
-        lines.append("")
-        lines.append("Diagnostics")
-        lines.append("-" * 78)
-        lines.append(
-            f"required inject={MemGateEvaluator._fmt_pct(diag.get('required_injection_rate'))} | "
-            f"neutral false inject={MemGateEvaluator._fmt_pct(diag.get('neutral_false_injection_rate'))} | "
-            f"forbidden false inject={MemGateEvaluator._fmt_pct(diag.get('forbidden_false_injection_rate'))}"
-        )
-        lines.append(
-            f"avg index={timing.get('index_time_avg_s', 0):.6f}s | "
-            f"avg recall={timing.get('recall_time_avg_s', 0):.6f}s | "
-            f"avg decide={timing.get('decide_time_avg_s', 0):.6f}s"
-        )
-
         if result.get("records_path"):
+            lines.append("")
             lines.append(f"records={result['records_path']}")
 
         return "\n".join(lines)
