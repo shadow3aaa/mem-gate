@@ -419,7 +419,13 @@ class MemGateEvaluator:
         total_answer_time = 0.0
         total_judge_time = 0.0
 
-        pbar = tqdm(entries, desc="MemGate Eval", unit="sample")
+        pbar = tqdm(
+            entries,
+            desc="MemGate Eval",
+            unit="sample",
+            position=0,
+            dynamic_ncols=True,
+        )
 
         for sample in pbar:
             sid = _sample_id(sample)
@@ -434,10 +440,19 @@ class MemGateEvaluator:
             memory_by_id: dict[str, dict[str, Any]] = {}
 
             t0 = time.perf_counter()
-            for memory in candidate_memories:
-                mid = _memory_id(memory)
-                memory_by_id[mid] = memory
-                system.index(mid, memory)
+            with tqdm(
+                candidate_memories,
+                desc=f"Index {sid[:16]}",
+                unit="memory",
+                leave=False,
+                position=1,
+                dynamic_ncols=True,
+            ) as index_pbar:
+                for memory in index_pbar:
+                    mid = _memory_id(memory)
+                    memory_by_id[mid] = memory
+                    index_pbar.set_postfix_str(mid[:32])
+                    system.index(mid, memory)
             total_index_time += time.perf_counter() - t0
 
             t0 = time.perf_counter()
