@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "json-repair>=0.59.10",
     "litellm>=1.86.0",
     "numpy>=2.4.6",
 ]

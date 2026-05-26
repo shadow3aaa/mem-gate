@@ -5,6 +5,7 @@ from collections import Counter
 from typing import Any
 
 from eval import MemGateEvaluator
+from foo_system_ollama import FooSystem
 
 
 class MySystem:
@@ -114,10 +115,19 @@ class MySystem:
 def main():
     evaluator = MemGateEvaluator("datas/memgate-eval.jsonl")
 
+    # result = evaluator.evaluate(
+    #     system_factory=lambda: MySystem(),
+    #     top_k=10,
+    #     save_records_path="results/runs/my_system.jsonl",
+    #     verbose=False,
+    #     judge_llm_config=None,
+    #     answer_llm_config=None,
+    # )
     result = evaluator.evaluate(
-        system_factory=lambda: MySystem(),
+        system_factory=lambda: FooSystem(),
         top_k=10,
-        save_records_path="results/runs/my_system.jsonl",
+        max_samples=3,
+        save_records_path="results/runs/foo_system.jsonl",
         verbose=False,
         judge_llm_config=None,
         answer_llm_config=None,
