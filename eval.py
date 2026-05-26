@@ -528,6 +528,12 @@ class MemGateEvaluator:
             record = {
                 "sample_id": sid,
                 "base_id": sample.get("base_id"),
+                "pair_id": sample.get("pair_id") or sample.get("availability_pair_id"),
+                "availability_condition": (
+                    sample.get("availability_condition")
+                    or sample.get("memory_condition")
+                    or sample.get("condition")
+                ),
                 "question_type": sample.get("question_type"),
                 "probe_type": probe_type,
                 "user_input": user_input,
@@ -935,61 +941,221 @@ Judging rules:
         return set(recalled_ids[:n_targets]) == target_ids
 
     @staticmethod
-    def _record_gate_aware_recall_scores(record: dict[str, Any]) -> dict[str, int]:
+    def _record_gate_aware_recall_scores(
+        record: dict[str, Any],
+        *,
+        eval_ks: list[int],
+    ) -> dict[str, int]:
         """
-        Gate-aware recall scoring.
+        Gate-aware recall scoring for an arbitrary set of k values.
 
-        Overall score:
-        - If the gate decision is wrong, all R@k scores are 0.
-        - If gold should_inject is false and the gate correctly rejects, all R@k
-          scores are 1 because no memory should be recalled/used.
-        - If gold should_inject is true and the gate correctly injects, R@k is
-          computed against target_memories in recalled_ids.
+        Overall R@k:
+        - If the gate decision is wrong, score is 0.
+        - If gold should_inject=false and the gate correctly rejects, score is 1.
+        - If gold should_inject=true and the gate correctly injects, score is
+          target hit in recalled_ids[:k].
 
-        Positive/gate-true score:
+        Gate=True R@k:
         - Only meaningful for gold should_inject=true records.
         - If gate is wrong, score is 0.
-        - Otherwise R@k is computed against target_memories.
+        - Otherwise score is target hit in recalled_ids[:k].
+
+        R@1 uses the stricter target-prefix rule:
+        - one target: target must be rank 1.
+        - multiple targets: all targets must occupy the first len(targets)
+          positions, in any order, with no non-target interleaved.
         """
         gold_should = bool(record["stage1"]["gold_should_inject"])
         gate_correct = bool(record["stage1"]["correct"])
         recalled_ids = list(record.get("recalled_ids", []))
         target_ids = set(record.get("gold", {}).get("target_memories", []))
 
+        out: dict[str, int] = {"is_positive": int(gold_should)}
+
         if not gate_correct:
-            return {
-                "overall_r10": 0,
-                "overall_r5": 0,
-                "overall_r1": 0,
-                "positive_r10": 0,
-                "positive_r5": 0,
-                "positive_r1": 0,
-                "is_positive": int(gold_should),
-            }
+            for k in eval_ks:
+                out[f"overall_r{k}"] = 0
+                out[f"positive_r{k}"] = 0
+            return out
 
         if not gold_should:
+            for k in eval_ks:
+                out[f"overall_r{k}"] = 1
+                out[f"positive_r{k}"] = 0
+            return out
+
+        for k in eval_ks:
+            if k == 1:
+                score = int(MemGateEvaluator._target_front_hit(recalled_ids, target_ids))
+            else:
+                score = int(MemGateEvaluator._target_hit_at(recalled_ids, target_ids, k))
+            out[f"overall_r{k}"] = score
+            out[f"positive_r{k}"] = score
+
+        return out
+
+    @staticmethod
+    def _normalize_availability_condition(value: Any) -> str | None:
+        if value is None:
+            return None
+
+        x = str(value).strip().lower().replace("-", "_")
+
+        with_aliases = {
+            "with_relevant_memory",
+            "with_memory",
+            "has_relevant_memory",
+            "relevant_memory",
+            "positive_memory",
+            "memory_present",
+            "present",
+            "with",
+        }
+
+        without_aliases = {
+            "without_relevant_memory",
+            "without_memory",
+            "no_relevant_memory",
+            "irrelevant_memory_only",
+            "negative_memory",
+            "memory_absent",
+            "absent",
+            "without",
+        }
+
+        if x in with_aliases:
+            return "with_relevant_memory"
+
+        if x in without_aliases:
+            return "without_relevant_memory"
+
+        return x
+
+    @staticmethod
+    def _aggregate_availability_pairs(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+        availability_records = [
+            r
+            for r in records
+            if r.get("pair_id") is not None
+            and MemGateEvaluator._normalize_availability_condition(
+                r.get("availability_condition")
+            )
+            in {"with_relevant_memory", "without_relevant_memory"}
+        ]
+
+        if not availability_records:
+            return None
+
+        pairs: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+        for record in availability_records:
+            pair_id = str(record["pair_id"])
+            condition = MemGateEvaluator._normalize_availability_condition(
+                record.get("availability_condition")
+            )
+            if condition is None:
+                continue
+            pairs.setdefault(pair_id, {}).setdefault(condition, []).append(record)
+
+        complete_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        duplicate_condition_pairs = 0
+
+        for pair in pairs.values():
+            with_records = pair.get("with_relevant_memory", [])
+            without_records = pair.get("without_relevant_memory", [])
+
+            if not with_records or not without_records:
+                continue
+
+            if len(with_records) > 1 or len(without_records) > 1:
+                duplicate_condition_pairs += 1
+
+            complete_pairs.append((with_records[0], without_records[0]))
+
+        if not complete_pairs:
             return {
-                "overall_r10": 1,
-                "overall_r5": 1,
-                "overall_r1": 1,
-                "positive_r10": 0,
-                "positive_r5": 0,
-                "positive_r1": 0,
-                "is_positive": 0,
+                "n_records": len(availability_records),
+                "n_pairs": len(pairs),
+                "n_complete_pairs": 0,
+                "duplicate_condition_pairs": duplicate_condition_pairs,
             }
 
-        r10 = int(MemGateEvaluator._target_hit_at(recalled_ids, target_ids, 10))
-        r5 = int(MemGateEvaluator._target_hit_at(recalled_ids, target_ids, 5))
-        r1 = int(MemGateEvaluator._target_front_hit(recalled_ids, target_ids))
+        pair_correct: list[bool] = []
+        pair_decision_flip: list[bool] = []
+        same_input: list[bool] = []
+
+        with_memory_target_recalled: list[bool] = []
+        with_memory_injected: list[bool] = []
+        with_memory_target_selected: list[bool] = []
+
+        without_memory_false_injected: list[bool] = []
+        without_memory_forbidden_recalled: list[bool] = []
+        without_memory_forbidden_selected_when_injected: list[bool] = []
+
+        for with_record, without_record in complete_pairs:
+            with_correct = bool(with_record["stage1"]["correct"])
+            without_correct = bool(without_record["stage1"]["correct"])
+            pair_correct.append(with_correct and without_correct)
+
+            with_pred = bool(with_record["stage1"]["pred_should_inject"])
+            without_pred = bool(without_record["stage1"]["pred_should_inject"])
+            pair_decision_flip.append(with_pred != without_pred)
+
+            same_input.append(
+                str(with_record.get("user_input", ""))
+                == str(without_record.get("user_input", ""))
+            )
+
+            with_memory_target_recalled.append(
+                bool(with_record["stage0"]["target_recalled"])
+            )
+            with_memory_injected.append(with_pred)
+            with_memory_target_selected.append(
+                bool(with_record["stage2"]["target_selected_from_recalled"])
+            )
+
+            without_memory_false_injected.append(without_pred)
+            without_memory_forbidden_recalled.append(
+                bool(without_record["stage0"]["forbidden_recalled"])
+            )
+
+            if without_pred:
+                without_memory_forbidden_selected_when_injected.append(
+                    bool(without_record["stage2"]["forbidden_selected"])
+                )
 
         return {
-            "overall_r10": r10,
-            "overall_r5": r5,
-            "overall_r1": r1,
-            "positive_r10": r10,
-            "positive_r5": r5,
-            "positive_r1": r1,
-            "is_positive": 1,
+            "n_records": len(availability_records),
+            "n_pairs": len(pairs),
+            "n_complete_pairs": len(complete_pairs),
+            "duplicate_condition_pairs": duplicate_condition_pairs,
+            "same_input_rate": round(_mean(same_input), 4),
+            "pair_accuracy": round(_mean(pair_correct), 4),
+            "decision_flip_rate": round(_mean(pair_decision_flip), 4),
+            "with_memory_target_recall_rate": round(
+                _mean(with_memory_target_recalled),
+                4,
+            ),
+            "with_memory_injection_rate": round(_mean(with_memory_injected), 4),
+            "with_memory_target_selection_rate": round(
+                _mean(with_memory_target_selected),
+                4,
+            ),
+            "without_memory_false_injection_rate": round(
+                _mean(without_memory_false_injected),
+                4,
+            ),
+            "without_memory_forbidden_recall_rate": round(
+                _mean(without_memory_forbidden_recalled),
+                4,
+            ),
+            "without_memory_forbidden_selection_rate_when_injected": round(
+                _mean(without_memory_forbidden_selected_when_injected),
+                4,
+            ),
+            "n_without_memory_injected": len(
+                without_memory_forbidden_selected_when_injected
+            ),
         }
 
     @staticmethod
@@ -1114,40 +1280,31 @@ Judging rules:
                 ),
             }
 
+        eval_ks = sorted({1, 5, 10, 20, 50, 100, top_k})
+        eval_ks = [k for k in eval_ks if 1 <= k <= top_k]
+
         gate_aware_scores = [
-            MemGateEvaluator._record_gate_aware_recall_scores(r) for r in records
+            MemGateEvaluator._record_gate_aware_recall_scores(r, eval_ks=eval_ks)
+            for r in records
         ]
         positive_scores = [s for s in gate_aware_scores if s["is_positive"]]
 
-        primary_metrics = {
+        primary_metrics: dict[str, Any] = {
             "gate_accuracy": round(_mean(stage1_correct), 4),
-            "overall_recall_at_10": round(
-                _mean([s["overall_r10"] for s in gate_aware_scores]),
-                4,
-            ),
-            "overall_recall_at_5": round(
-                _mean([s["overall_r5"] for s in gate_aware_scores]),
-                4,
-            ),
-            "overall_recall_at_1": round(
-                _mean([s["overall_r1"] for s in gate_aware_scores]),
-                4,
-            ),
-            "gate_true_recall_at_10": round(
-                _mean([s["positive_r10"] for s in positive_scores]),
-                4,
-            ),
-            "gate_true_recall_at_5": round(
-                _mean([s["positive_r5"] for s in positive_scores]),
-                4,
-            ),
-            "gate_true_recall_at_1": round(
-                _mean([s["positive_r1"] for s in positive_scores]),
-                4,
-            ),
+            "eval_ks": eval_ks,
             "n_total": len(records),
             "n_gate_true": len(positive_scores),
         }
+
+        for k in eval_ks:
+            primary_metrics[f"overall_recall_at_{k}"] = round(
+                _mean([s[f"overall_r{k}"] for s in gate_aware_scores]),
+                4,
+            )
+            primary_metrics[f"gate_true_recall_at_{k}"] = round(
+                _mean([s[f"positive_r{k}"] for s in positive_scores]),
+                4,
+            )
 
         result: dict[str, Any] = {
             "primary_metrics": primary_metrics,
@@ -1222,6 +1379,10 @@ Judging rules:
             "by_question_type": by_question_type,
         }
 
+        availability_pairs = MemGateEvaluator._aggregate_availability_pairs(records)
+        if availability_pairs is not None:
+            result["availability_pairs"] = availability_pairs
+
         judged = [r for r in records if r.get("judge") is not None]
         if judged:
             result["stage3_response_quality"] = {
@@ -1272,15 +1433,24 @@ Judging rules:
         primary = result.get("primary_metrics", {})
         availability = result.get("availability_pairs")
 
-        rows = [
-            ("Gate Acc", primary.get("gate_accuracy")),
-            ("Overall R@10", primary.get("overall_recall_at_10")),
-            ("Overall R@5", primary.get("overall_recall_at_5")),
-            ("Overall R@1", primary.get("overall_recall_at_1")),
-            ("Gate=True R@10", primary.get("gate_true_recall_at_10")),
-            ("Gate=True R@5", primary.get("gate_true_recall_at_5")),
-            ("Gate=True R@1", primary.get("gate_true_recall_at_1")),
-        ]
+        eval_ks = list(primary.get("eval_ks") or [1, 5, 10])
+        eval_ks = sorted({int(k) for k in eval_ks}, reverse=True)
+
+        rows = [("Gate Acc", primary.get("gate_accuracy"))]
+        rows.extend(
+            (
+                f"Overall R@{k}",
+                primary.get(f"overall_recall_at_{k}"),
+            )
+            for k in eval_ks
+        )
+        rows.extend(
+            (
+                f"Gate=True R@{k}",
+                primary.get(f"gate_true_recall_at_{k}"),
+            )
+            for k in eval_ks
+        )
 
         lines: list[str] = []
         lines.append("")
@@ -1293,10 +1463,10 @@ Judging rules:
             f"stage3={'on' if result.get('stage3_enabled') else 'off'}"
         )
         lines.append("")
-        lines.append(f"{'Metric':<18} {'Value':>8}")
-        lines.append(f"{'-' * 18} {'-' * 8}")
+        lines.append(f"{'Metric':<20} {'Value':>8}")
+        lines.append(f"{'-' * 20} {'-' * 8}")
         for name, value in rows:
-            lines.append(f"{name:<18} {MemGateEvaluator._fmt_pct(value):>8}")
+            lines.append(f"{name:<20} {MemGateEvaluator._fmt_pct(value):>8}")
 
         if availability:
             lines.append("")

@@ -6,6 +6,8 @@ from typing import Any
 
 from eval import MemGateEvaluator
 from foo_system_ollama import FooSystem
+from hybrid_bert_gate_system import HybridBertGateSystem
+from hybrid_broad_recall_system import HybridBroadRecallSystem
 
 
 class MySystem:
@@ -123,14 +125,28 @@ def main():
     #     judge_llm_config=None,
     #     answer_llm_config=None,
     # )
+    # result = evaluator.evaluate(
+    #     system_factory=lambda: FooSystem(),
+    #     top_k=10,
+    #     max_samples=3,
+    #     save_records_path="results/runs/foo_system.jsonl",
+    #     verbose=False,
+    #     judge_llm_config=None,
+    #     answer_llm_config=None,
+    # )
+    # result = evaluator.evaluate(
+    #     system_factory=lambda: HybridBroadRecallSystem(),
+    #     top_k=50,
+    #     probe_types=["required", "availability_with_memory"],
+    #     save_records_path="results/runs/hybrid_broad_recall_top10.jsonl",
+    #     verbose=False,
+    # )
     result = evaluator.evaluate(
-        system_factory=lambda: FooSystem(),
+        system_factory=lambda: HybridBertGateSystem(),
         top_k=10,
-        max_samples=3,
-        save_records_path="results/runs/foo_system.jsonl",
+        probe_types=["required", "availability_with_memory"],
+        save_records_path="results/runs/hybrid_bert_gate_positive_top10.jsonl",
         verbose=False,
-        judge_llm_config=None,
-        answer_llm_config=None,
     )
 
     evaluator.print_report(result)
